@@ -1,0 +1,16 @@
+services:
+  translator:
+    image: localhost/translator-api:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: translator
+    env_file:
+      - .env.docker
+    ports:
+      - "28002:8000"
+    volumes:
+      - ./data:/app/data
+      - ./log:/app/log
+      - ./tmp:/app/tmp
+    restart: unless-stopped

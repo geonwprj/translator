@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Project specific
+scratch/
+log/
+tmp/
+data/
+.env
+.env.docker
+.agent/
+.DS_Store
