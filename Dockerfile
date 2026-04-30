@@ -10,7 +10,6 @@ ENV PYTHONPATH=/app/src
 # Copy project files
 COPY pyproject.toml uv.lock ./
 COPY src ./src
-COPY .env.docker ./.env
 
 # Install dependencies
 RUN uv sync --frozen --no-dev
