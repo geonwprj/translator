@@ -137,10 +137,16 @@ def get_effective_threshold(chunk_text_len: int) -> int:
         return settings.translate_small_chunk_score
     return settings.translate_threshold_score
 
-async def process_translation_chunk(chunk_id: str):
+async def process_translation_chunk(chunk_id: str, db: Session = None):
     """Process a single translation chunk independently in background."""
     logger.info(f"Starting processing for chunk {chunk_id}")
-    db: Session = db_client.SessionLocal()
+    
+    # Use provided session or create a new one
+    should_close = False
+    if db is None:
+        db = db_client.SessionLocal()
+        should_close = True
+        
     try:
         chunk = db.query(TranslationChunk).filter(TranslationChunk.id == chunk_id).first()
         if not chunk:
@@ -265,7 +271,8 @@ async def process_translation_chunk(chunk_id: str):
                 await trigger_webhook(task.id, db)
 
     finally:
-        db.close()
+        if should_close:
+            db.close()
 
 async def process_full_task(task_id: str):
     """Processes all non-completed chunks in a task dynamically."""
@@ -297,7 +304,7 @@ async def process_full_task(task_id: str):
                     db.commit()
                 break
 
-            await process_translation_chunk(chunk.id)
+            await process_translation_chunk(chunk.id, db=db)
             # Refetch task/chunks if necessary, but process_translation_chunk handles its own commits
 
         # Final check if everything is completed

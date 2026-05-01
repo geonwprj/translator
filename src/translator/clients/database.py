@@ -13,7 +13,10 @@ class DatabaseClient:
         self.database_url = f"sqlite:///{db_path}"
         self.engine = create_engine(
             self.database_url, 
-            connect_args={"check_same_thread": False}
+            connect_args={"check_same_thread": False},
+            pool_size=20,
+            max_overflow=10,
+            pool_pre_ping=True
         )
         self.SessionLocal = sessionmaker(
             autocommit=False, 
