@@ -11,14 +11,6 @@ class Settings(BaseSettings):
     db_path: str = "./data/translator.db"
     root_path: str = ""
     
-    llm_host: str = "localhost"
-    llm_port: int = 80
-    llm_secure: bool = False
-    llm_api_key: str = ""
-    llm_translate_model: str = "translategemma-speed"
-    llm_judge_model: str = "gemma-4-31b"
-    llm_cooldown: int = 300
-    
     translate_chunk_max_chars: int = 1000
     translate_smallest_chunk: int = 400
     translate_max_review_cycle: int = 3

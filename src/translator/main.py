@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="translator",
     description="Novel translation service from written Chinese to HK Cantonese for TTS.",
-    version="0.1.4",
+    version="0.1.5",
     root_path=settings.root_path,
     docs_url="/docs",
     redoc_url="/redoc",
