@@ -1,14 +1,39 @@
 import json
 import logging
+import asyncio
+import time
 from litellm import acompletion
+from litellm.exceptions import RateLimitError
 from translator.configs.base import settings
 from translator.configs.prompt.translate import TRANSLATE_PROMPT
 from translator.configs.prompt.judge import JUDGE_PROMPT
 
 logger = logging.getLogger(__name__)
 
+# Global state for cooldown
+_cooldown_until: float = 0
+_cooldown_lock = asyncio.Lock()
+
+async def _handle_cooldown():
+    """Checks if cooldown is active and waits if necessary."""
+    global _cooldown_until
+    async with _cooldown_lock:
+        now = time.time()
+        if now < _cooldown_until:
+            wait_time = _cooldown_until - now
+            logger.warning(f"LLM Cooldown active. Waiting for {wait_time:.1f} seconds...")
+            await asyncio.sleep(wait_time)
+
+def _set_cooldown():
+    """Sets the cooldown period."""
+    global _cooldown_until
+    _cooldown_until = time.time() + settings.llm_cooldown
+    logger.error(f"LLM Rate Limit (429) hit. Cooldown set for {settings.llm_cooldown} seconds.")
+
 async def translate_chunk(text: str, previous_translation: str = None, feedback: str = None) -> str:
     """Uses translator LLM to translate written Chinese to HK Cantonese."""
+    await _handle_cooldown()
+    
     api_base = f"http://{settings.llm_host}:{settings.llm_port}"
     if settings.llm_secure:
         api_base = f"https://{settings.llm_host}:{settings.llm_port}"
@@ -29,12 +54,17 @@ async def translate_chunk(text: str, previous_translation: str = None, feedback:
         content = response.choices[0].message.content
         logger.info(f"Translation result (first 100 chars): {content[:100] if content else 'NONE'}")
         return content.strip() if content else ""
+    except RateLimitError:
+        _set_cooldown()
+        raise
     except Exception as e:
         logger.error(f"Translation failed: {e}")
         raise
 
 async def judge_chunk(original: str, translated: str, failure_feedback: str = None) -> dict:
     """Uses judge LLM to review the translation and output JSON."""
+    await _handle_cooldown()
+    
     api_base = f"http://{settings.llm_host}:{settings.llm_port}"
     if settings.llm_secure:
         api_base = f"https://{settings.llm_host}:{settings.llm_port}"
@@ -72,6 +102,9 @@ async def judge_chunk(original: str, translated: str, failure_feedback: str = No
                 content = content[:-3]
         
         return json.loads(content)
+    except RateLimitError:
+        _set_cooldown()
+        raise
     except Exception as e:
         logger.error(f"Judge failed: {e}")
         # Default failing score if json decode errors or API fails

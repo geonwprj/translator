@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_translate_model: str = "translategemma-speed"
     llm_judge_model: str = "gemma-4-31b"
+    llm_cooldown: int = 300
     
     translate_chunk_max_chars: int = 1000
     translate_smallest_chunk: int = 400
