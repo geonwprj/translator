@@ -23,7 +23,7 @@ async def trigger_webhook(task_id: str, db: Session):
         "translated_text": combined_text
     }
     
-    logger.info(f"Triggering webhook for task {task_id} to {task.webhook_url}")
+    logger.info(f"Triggering webhook for task {task_id} (status: {task.status}) to {task.webhook_url}")
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(task.webhook_url, json=payload, timeout=30.0)
@@ -53,6 +53,22 @@ def split_text_into_chunks(text: str, max_chars: int) -> list[str]:
         chunks.append(delimiter.join(current_chunk))
 
     return chunks
+
+def deduplicate_text(text: str) -> str:
+    """Removes identical consecutive sentences/paragraphs."""
+    if not text:
+        return text
+    lines = text.split("\n")
+    new_lines = []
+    prev_line = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped and stripped == prev_line:
+            continue
+        new_lines.append(line)
+        if stripped:
+            prev_line = stripped
+    return "\n".join(new_lines)
 
 def find_split_point(text: str) -> int:
     """Finds a natural split point in the text."""
@@ -137,6 +153,49 @@ def get_effective_threshold(chunk_text_len: int) -> int:
         return settings.translate_small_chunk_score
     return settings.translate_threshold_score
 
+async def update_task_status(task_id: str, db: Session):
+    """Consolidated logic to update task status based on its chunks and trigger webhook."""
+    task = db.query(TranslationTask).filter(TranslationTask.id == task_id).first()
+    if not task:
+        return
+    
+    chunks = db.query(TranslationChunk).filter(TranslationChunk.task_id == task_id).all()
+    if not chunks:
+        return
+
+    statuses = [c.status for c in chunks]
+    any_failed = "failed" in statuses
+    any_translating = "translating" in statuses
+    any_reviewing = "reviewing" in statuses
+    any_pending = "pending" in statuses
+    all_completed = all(s == "completed" for s in statuses)
+    
+    old_status = task.status
+    new_status = old_status
+
+    if any_translating:
+        new_status = "translating"
+    elif any_reviewing:
+        new_status = "reviewing"
+    elif any_pending:
+        new_status = "translating"
+    elif any_failed:
+        new_status = "failed"
+    elif all_completed:
+        new_status = "completed"
+    else:
+        new_status = "pending"
+        
+    if old_status != new_status:
+        logger.info(f"Task {task_id} status changing: {old_status} -> {new_status}")
+        task.status = new_status
+        db.commit()
+        
+        # Trigger webhook when moving to a terminal state
+        if new_status in ("completed", "failed") and old_status not in ("completed", "failed"):
+            if task.webhook_url:
+                await trigger_webhook(task.id, db)
+
 async def process_translation_chunk(chunk_id: str, db: Session = None):
     """Process a single translation chunk independently in background."""
     logger.info(f"Starting processing for chunk {chunk_id}")
@@ -168,6 +227,7 @@ async def process_translation_chunk(chunk_id: str, db: Session = None):
             try:
                 # 1. Translate (using previous best and feedback if available)
                 new_translation = await translate_chunk(chunk.original_text, best_translation, failure_feedback)
+                new_translation = deduplicate_text(new_translation)
                 
                 # 2. Judge
                 chunk.status = "reviewing"
@@ -176,16 +236,30 @@ async def process_translation_chunk(chunk_id: str, db: Session = None):
                 judge_result = await judge_chunk(chunk.original_text, new_translation, failure_feedback)
                 new_score = judge_result.get("score", 0)
                 new_feedback = judge_result.get("feedback", "")
+                improved_translation = judge_result.get("improved_translation", "").strip()
                 
-                # Handle auto-split on null content
+                # 3. Handle auto-split on null content
                 if new_feedback == "Judge LLM returned null content":
                     logger.warning(f"Null content detected for chunk {chunk.id}. Triggering auto-split.")
                     if handle_chunk_split(db, chunk, reason="Auto-split (null judge content)"):
                         return # Exit current worker; split chunks will be picked up by process_full_task
 
-                # 3. Evaluate and Rollback Logic
+                # 4. Use improved translation if provided and current score is low
+                if improved_translation and improved_translation != new_translation and new_score < threshold:
+                    logger.info(f"Judge provided an improved version for chunk {chunk.id}. Swapping candidate.")
+                    improved_translation = deduplicate_text(improved_translation)
+                    # We'll re-judge it to be sure it's actually better
+                    improved_judge = await judge_chunk(chunk.original_text, improved_translation, failure_feedback)
+                    improved_score = improved_judge.get("score", 0)
+                    if improved_score > new_score:
+                        logger.info(f"Improved version score: {improved_score} > {new_score}. Accepting improvement.")
+                        new_translation = improved_translation
+                        new_score = improved_score
+                        new_feedback = improved_judge.get("feedback", "")
+
+                # 5. Evaluate and Rollback Logic
                 if new_score > best_score:
-                    logger.info(f"Chunk {chunk.id} achieved better score: {new_score} > {best_score}. Updating best version.")
+                    logger.info(f"Chunk {chunk_id} achieved better score: {new_score} > {best_score}. Updating best version.")
                     best_score = new_score
                     best_translation = new_translation
                     
@@ -193,9 +267,7 @@ async def process_translation_chunk(chunk_id: str, db: Session = None):
                     chunk.translated_text = best_translation
                     chunk.score = best_score
                 else:
-                    logger.info(f"Chunk {chunk.id} new score {new_score} <= best score {best_score}. Rolling back to previous best version.")
-                    # We keep the best_translation and best_score in the DB
-                    # But we take the latest feedback (new_feedback) to try and improve even more next time
+                    logger.info(f"Chunk {chunk_id} new score {new_score} <= best score {best_score}. Rolling back to previous best version.")
                 
                 failure_feedback = new_feedback
                 chunk.failure_reason = new_feedback
@@ -206,7 +278,7 @@ async def process_translation_chunk(chunk_id: str, db: Session = None):
                     chunk.status = "completed"
                     chunk.failure_reason = None
                     db.commit()
-                    logger.info(f"Chunk {chunk.id} passed threshold ({best_score} >= {threshold}). Completed.")
+                    logger.info(f"Chunk {chunk_id} passed threshold ({best_score} >= {threshold}). Completed.")
                     break
             except Exception as e:
                 logger.error(f"Error processing chunk {chunk.id}: {e}")
@@ -244,31 +316,8 @@ async def process_translation_chunk(chunk_id: str, db: Session = None):
             )
             db.commit()
 
-        # Update Task Status
-        task = db.query(TranslationTask).filter(TranslationTask.id == chunk.task_id).first()
-        if task:
-            chunks = db.query(TranslationChunk).filter(TranslationChunk.task_id == task.id).all()
-            all_completed = all(c.status == "completed" for c in chunks)
-            any_failed = any(c.status == "failed" for c in chunks)
-            any_translating = any(c.status == "translating" for c in chunks)
-            any_reviewing = any(c.status == "reviewing" for c in chunks)
-            
-            old_status = task.status
-            
-            if any_translating:
-                task.status = "translating"
-            elif any_reviewing:
-                task.status = "reviewing"
-            elif any_failed:
-                task.status = "failed"
-            elif all_completed:
-                task.status = "completed"
-            else:
-                task.status = "pending"
-            db.commit()
-
-            if old_status != "completed" and task.status == "completed" and task.webhook_url:
-                await trigger_webhook(task.id, db)
+        # Update Task Status and trigger webhook if terminal
+        await update_task_status(chunk.task_id, db)
 
     finally:
         if should_close:
@@ -294,28 +343,12 @@ async def process_full_task(task_id: str):
             ).order_by(TranslationChunk.chunk_index.asc()).first()
 
             if not chunk:
-                # Check if any actually failed
-                any_failed = db.query(TranslationChunk).filter(
-                    TranslationChunk.task_id == task_id,
-                    TranslationChunk.status == "failed"
-                ).first()
-                if any_failed:
-                    task.status = "failed"
-                    db.commit()
                 break
 
             await process_translation_chunk(chunk.id, db=db)
-            # Refetch task/chunks if necessary, but process_translation_chunk handles its own commits
 
-        # Final check if everything is completed
-        chunks = db.query(TranslationChunk).filter(TranslationChunk.task_id == task_id).all()
-        if all(c.status == "completed" for c in chunks):
-            old_status = task.status
-            task.status = "completed"
-            db.commit()
-            
-            if old_status != "completed" and task.status == "completed" and getattr(task, 'webhook_url', None):
-                await trigger_webhook(task.id, db)
+        # Final status check and potential webhook trigger
+        await update_task_status(task_id, db)
 
     finally:
         db.close()
