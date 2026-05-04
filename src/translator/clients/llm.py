@@ -118,26 +118,36 @@ async def judge_chunk(original: str, translated: str, failure_feedback: str = No
                 logger.warning(f"Using alternate model: {model_name}")
 
             try:
-                response = await acompletion(
-                    model=model_full_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    api_base=api_base,
-                    api_key=llm_settings.api_key,
-                    response_format={"type": "json_object"}
-                )
-            except (BadRequestError, Exception) as e:
-                # Handle models that don't support JSON mode (e.g. gemma-3-27b-it)
-                is_json_error = "JSON mode is not enabled" in str(e) or isinstance(e, BadRequestError)
-                if is_json_error:
-                    logger.warning(f"JSON mode not supported or BadRequest for {model_name}, retrying without response_format. Error: {e}")
+                # Prepare the prompt using replacement to avoid .format() issues with braces in feedback
+                current_prompt = JUDGE_PROMPT.replace("{original}", original)
+                current_prompt = current_prompt.replace("{translated}", translated)
+                current_prompt = current_prompt.replace("{feedback_section}", feedback_section)
+
+                kwargs = {
+                    "model": model_full_name,
+                    "messages": [{"role": "user", "content": current_prompt}],
+                    "api_base": api_base,
+                    "api_key": llm_settings.api_key,
+                }
+                
+                try:
+                    logger.info(f"Attempting judge with model {model_full_name} (JSON mode enabled)")
                     response = await acompletion(
-                        model=model_full_name,
-                        messages=[{"role": "user", "content": prompt}],
-                        api_base=api_base,
-                        api_key=llm_settings.api_key
+                        **kwargs,
+                        response_format={"type": "json_object"}
                     )
-                else:
-                    raise
+                except Exception as e:
+                    # Handle models that don't support JSON mode
+                    error_str = str(e)
+                    if "JSON mode is not enabled" in error_str or "BadRequestError" in type(e).__name__:
+                        logger.warning(f"JSON mode not supported for {model_name}, retrying without it. Error: {error_str[:100]}")
+                        # Retry without response_format at all
+                        response = await acompletion(**kwargs)
+                    else:
+                        raise
+            except (BadRequestError, Exception) as e:
+                logger.error(f"Judge request failed for model {model_name}: {e}")
+                raise
 
             content = response.choices[0].message.content
             logger.info(f"Judge raw content: {content}")
