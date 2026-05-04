@@ -2,8 +2,9 @@ import json
 import logging
 import asyncio
 import time
+import re
 from litellm import acompletion
-from litellm.exceptions import RateLimitError
+from litellm.exceptions import RateLimitError, BadRequestError
 from translator.configs.llm import llm_settings
 from translator.configs.prompt.translate import TRANSLATE_PROMPT
 from translator.configs.prompt.judge import JUDGE_PROMPT
@@ -116,13 +117,28 @@ async def judge_chunk(original: str, translated: str, failure_feedback: str = No
             if model_name != llm_settings.judge_model:
                 logger.warning(f"Using alternate model: {model_name}")
 
-            response = await acompletion(
-                model=model_full_name,
-                messages=[{"role": "user", "content": prompt}],
-                api_base=api_base,
-                api_key=llm_settings.api_key,
-                response_format={"type": "json_object"}
-            )
+            try:
+                response = await acompletion(
+                    model=model_full_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    api_base=api_base,
+                    api_key=llm_settings.api_key,
+                    response_format={"type": "json_object"}
+                )
+            except (BadRequestError, Exception) as e:
+                # Handle models that don't support JSON mode (e.g. gemma-3-27b-it)
+                is_json_error = "JSON mode is not enabled" in str(e) or isinstance(e, BadRequestError)
+                if is_json_error:
+                    logger.warning(f"JSON mode not supported or BadRequest for {model_name}, retrying without response_format. Error: {e}")
+                    response = await acompletion(
+                        model=model_full_name,
+                        messages=[{"role": "user", "content": prompt}],
+                        api_base=api_base,
+                        api_key=llm_settings.api_key
+                    )
+                else:
+                    raise
+
             content = response.choices[0].message.content
             logger.info(f"Judge raw content: {content}")
             if content is None:
@@ -130,13 +146,17 @@ async def judge_chunk(original: str, translated: str, failure_feedback: str = No
                 
             content = content.strip()
             
-            # In case the model returns markdown JSON blocks
-            if content.startswith("```json"):
-                content = content.replace("```json", "", 1)
-                if content.endswith("```"):
-                    content = content[:-3]
+            # Robust JSON extraction: look for the first '{' and last '}'
+            # This handles markdown blocks and conversational noise
+            json_match = re.search(r"(\{.*\})", content, re.DOTALL)
+            if json_match:
+                content = json_match.group(1)
             
-            return json.loads(content)
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON Parse Error for model {model_name}: {e}. Raw content: {content}")
+                return {"score": 0, "feedback": f"API returned malformed JSON: {str(e)}"}
 
         except RateLimitError as e:
             last_exception = e
